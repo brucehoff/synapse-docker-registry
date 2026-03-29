@@ -10,8 +10,11 @@ from aws_cdk import (Stack,
     aws_lambda,
     aws_logs as logs,
     aws_wafv2 as wafv2,
+    aws_events as events,
+    aws_events_targets as targets,
     CfnOutput,
     Duration,
+    SecretValue,
     Tags)
 
 import config as config
@@ -82,11 +85,15 @@ class DockerFargateStack(Stack):
 
         # create a user
         user = iam.User(self, "DockerRegistryUser")
-        # create a key pair, storing the secret in Secret Manager
+        # create a key pair, storing both the access key ID and secret in Secrets Manager
+        # as a JSON object so they can be rotated together
         access_key = iam.AccessKey(self, "AccessKey", user=user)
         secret_stored_name = f'{env.get(config.STACK_NAME_PREFIX_CONTEXT)}-DockerFargateStack/{context}/access_key'
-        secret_stored_access_key = sm.Secret(self, secret_stored_name,
-            secret_string_value=access_key.secret_access_key
+        access_key_secret = sm.Secret(self, secret_stored_name,
+            secret_object_value={
+                "access_key_id": SecretValue.unsafe_plain_text(access_key.access_key_id),
+                "secret_access_key": access_key.secret_access_key,
+            }
         )
 
         # give the user S3 access
@@ -108,12 +115,12 @@ class DockerFargateStack(Stack):
                 ecs.Secret.from_secrets_manager(sm_secret, NOTIFICATION_AUTH_SECRET_JSON_KEY),
             HTTP_SECRET_SECRET_JSON_KEY:
                 ecs.Secret.from_secrets_manager(sm_secret, HTTP_SECRET_SECRET_JSON_KEY),
-            "AWS_SECRET_ACCESS_KEY": ecs.Secret.from_secrets_manager(secret_stored_access_key)
+            "AWS_ACCESS_KEY_ID": ecs.Secret.from_secrets_manager(access_key_secret, "access_key_id"),
+            "AWS_SECRET_ACCESS_KEY": ecs.Secret.from_secrets_manager(access_key_secret, "secret_access_key"),
         }
 
         env_vars = get_container_env(env)
         env_vars[BUCKET_NAME]=bucket_name
-        env_vars["AWS_ACCESS_KEY_ID"]=access_key.access_key_id
         env_vars["api_gateway_url"]=api_url
 
         # Build the container image for the registry
@@ -262,6 +269,86 @@ class DockerFargateStack(Stack):
         scalable_target.scale_on_memory_utilization("MemoryScaling",
             target_utilization_percent=50
         )
+
+        # ── Credential rotation ──────────────────────────────────────────────
+        # SSM parameter used to hand the old key ID from the rotation Lambda to
+        # the cleanup Lambda (which runs only after ECS confirms the new tasks
+        # are healthy, making it safe to delete the old key).
+        ssm_param_name = f'/{stack_prefix}/pending-key-deletion'
+        ssm_param_arn = f"arn:aws:ssm:{region}:{self.account}:parameter{ssm_param_name}"
+
+        rotation_lambda = aws_lambda.Function(self, "RotationLambda",
+            runtime=aws_lambda.Runtime.PYTHON_3_13,
+            handler="index.handler",
+            code=aws_lambda.Code.from_asset("docker_fargate/rotation_lambda"),
+            timeout=Duration.minutes(5),
+            environment={
+                "IAM_USERNAME": user.user_name,
+                "SSM_PARAM_NAME": ssm_param_name,
+                "ECS_CLUSTER_ARN": cluster.cluster_arn,
+                "ECS_SERVICE_ARN": load_balanced_fargate_service.service.service_arn,
+            },
+        )
+
+        # Secrets Manager needs read + write on the secret
+        access_key_secret.grant_read(rotation_lambda)
+        rotation_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["secretsmanager:PutSecretValue", "secretsmanager:UpdateSecretVersionStage"],
+            resources=[access_key_secret.secret_arn],
+        ))
+        rotation_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["iam:CreateAccessKey"],
+            resources=[user.user_arn],
+        ))
+        rotation_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["ecs:UpdateService"],
+            resources=[load_balanced_fargate_service.service.service_arn],
+        ))
+        rotation_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:PutParameter"],
+            resources=[ssm_param_arn],
+        ))
+
+        # Wire up 90-day automatic rotation; this also grants Secrets Manager
+        # permission to invoke the Lambda
+        access_key_secret.add_rotation_schedule(
+            "AccessKeyRotationSchedule",
+            rotation_lambda=rotation_lambda,
+            automatically_after=Duration.days(90),
+        )
+
+        cleanup_lambda = aws_lambda.Function(self, "CleanupLambda",
+            runtime=aws_lambda.Runtime.PYTHON_3_13,
+            handler="index.handler",
+            code=aws_lambda.Code.from_asset("docker_fargate/cleanup_lambda"),
+            timeout=Duration.minutes(1),
+            environment={
+                "IAM_USERNAME": user.user_name,
+                "SSM_PARAM_NAME": ssm_param_name,
+            },
+        )
+        cleanup_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["iam:DeleteAccessKey"],
+            resources=[user.user_arn],
+        ))
+        cleanup_lambda.add_to_role_policy(iam.PolicyStatement(
+            actions=["ssm:GetParameter", "ssm:DeleteParameter"],
+            resources=[ssm_param_arn],
+        ))
+
+        # Trigger the cleanup Lambda once ECS reports the service is at steady
+        # state (all new tasks healthy), meaning the old credentials are no
+        # longer in use and it is safe to delete the old IAM key
+        events.Rule(self, "ECSDeploymentCompleteRule",
+            event_pattern=events.EventPattern(
+                source=["aws.ecs"],
+                detail_type=["ECS Service Action"],
+                resources=[load_balanced_fargate_service.service.service_arn],
+                detail={"eventName": ["SERVICE_STEADY_STATE"]},
+            ),
+            targets=[targets.LambdaFunction(cleanup_lambda)],
+        )
+        # ── End credential rotation ──────────────────────────────────────────
 
         # Tag all resources in this Stack's scope with context tags
         for key, value in env.get(config.TAGS_CONTEXT).items():
